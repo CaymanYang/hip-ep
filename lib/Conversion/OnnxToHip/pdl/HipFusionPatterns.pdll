@@ -31,6 +31,7 @@ Constraint IsFusableQConvGeometry(op: Op);
 Constraint IsPackedInt4PerChannelWeight(op: Op);
 Constraint IsPerChannelWeight(dequant: Op, consumer: Op);
 Constraint IsFusableQLpNormalization(op: Op);
+Constraint IsFusableQSigmoid(op: Op);
 
 Rewrite GetContextArg(op: Op) -> Value;
 Rewrite ExtractScaleValue(val: Value) -> Attr;
@@ -45,3 +46,4 @@ Rewrite ExtractAttrF32(op: Op, name: Attr, defaultValue: Attr) -> Attr;
 #include "QDQGemmFusion.pdll"
 #include "QDQConvFusion.pdll"
 #include "QDQLpNormalizationFusion.pdll"
+#include "QDQSigmoidFusion.pdll"
