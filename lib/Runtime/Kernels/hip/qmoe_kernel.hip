@@ -20,9 +20,6 @@
 
 static constexpr int kBlock = 256;
 static constexpr int kMaxK = 16;
-static constexpr int kRaggedTaskGemv = 0;
-static constexpr int kRaggedTaskWmma16 = 1;
-static constexpr int kRaggedTaskWmma64 = 2;
 // topk_routing runs one block per token with this many threads; per-expert exp
 // values are staged in dynamic shared memory sized num_experts at launch, so
 // there is no compile-time cap on the expert count.
@@ -325,8 +322,9 @@ __global__ void bucket_tokens_kernel(
   __syncthreads();
 
   // The ragged path additionally emits adaptive row groups and resets both
-  // persistent work queues. Descriptors are {expert,row_begin,row_count,kind};
-  // large experts use 64-row chunks while tails select GEMV/WMMA16/WMMA64.
+  // persistent work queues. Descriptors are
+  // {expert,row_begin,row_count,reserved}; the ragged MatMul selects its
+  // stage-specific task kind so FC1 and FC2 are not coupled here.
   if (eid == 0 && row_groups && row_group_count && fc1_queue_head &&
       fc2_queue_head) {
     int group = 0;
@@ -335,13 +333,10 @@ __global__ void bucket_tokens_kernel(
       const int end = expert_offsets[expert + 1];
       for (int row = begin; row < end; row += row_group_size) {
         const int rows = min(row_group_size, end - row);
-        const int task_kind = rows <= 7 ? kRaggedTaskGemv
-                              : rows <= 31 ? kRaggedTaskWmma16
-                                           : kRaggedTaskWmma64;
         row_groups[group * 4 + 0] = expert;
         row_groups[group * 4 + 1] = row;
         row_groups[group * 4 + 2] = rows;
-        row_groups[group * 4 + 3] = task_kind;
+        row_groups[group * 4 + 3] = 0;
         ++group;
       }
     }

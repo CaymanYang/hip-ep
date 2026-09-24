@@ -75,6 +75,58 @@ constexpr Shape kAdaptiveShapes[] = {
 
 enum class Routing { Balanced, EmptyExperts, Skewed };
 
+struct QueuePolicyExpectation {
+  const char* name;
+  uint32_t chunk;
+  bool grid_stride;
+};
+
+struct TaskPolicyExpectation {
+  const char* name;
+  int id;
+  int gemv_max_rows;
+  int wmma16_max_rows;
+};
+
+TaskPolicyExpectation expected_task_policy(bool fc1) {
+  const char* policy = std::getenv(
+      fc1 ? "HIPDNN_QMOE_RAGGED_FC1_TASK_POLICY"
+          : "HIPDNN_QMOE_RAGGED_FC2_TASK_POLICY");
+  if (!policy || std::strcmp(policy, "p0-current") == 0) {
+    return {"p0-current", 0, 7, 31};
+  }
+  if (std::strcmp(policy, "p1-early-wmma16") == 0) {
+    return {"p1-early-wmma16", 1, 3, 31};
+  }
+  if (std::strcmp(policy, "p2-early-wmma64") == 0) {
+    return {"p2-early-wmma64", 2, 7, 15};
+  }
+  if (std::strcmp(policy, "p3-early-both") == 0) {
+    return {"p3-early-both", 3, 3, 15};
+  }
+  return {"p0-current", 0, 7, 31};
+}
+
+QueuePolicyExpectation expected_queue_policy() {
+  const char* policy = std::getenv("HIPDNN_QMOE_RAGGED_QUEUE_POLICY");
+  if (!policy || std::strcmp(policy, "atomic1") == 0) {
+    return {"atomic1", 1, false};
+  }
+  if (std::strcmp(policy, "chunk2") == 0) {
+    return {"chunk2", 2, false};
+  }
+  if (std::strcmp(policy, "chunk4") == 0) {
+    return {"chunk4", 4, false};
+  }
+  if (std::strcmp(policy, "chunk8") == 0) {
+    return {"chunk8", 8, false};
+  }
+  if (std::strcmp(policy, "grid-stride") == 0) {
+    return {"grid-stride", 0, true};
+  }
+  return {"atomic1", 1, false};
+}
+
 const char* routing_name(Routing routing) {
   switch (routing) {
   case Routing::Balanced:
@@ -189,13 +241,10 @@ bool build_groups(const Shape& shape, const std::vector<int>& counts,
          group_begin += kMaxRowsPerGroup) {
       const int group_rows =
           std::min(kMaxRowsPerGroup, expert_end - group_begin);
-      const int task_kind = group_rows <= 7 ? kTaskGemv
-                            : group_rows <= 31 ? kTaskWmma16
-                                               : kTaskWmma64;
       groups.push_back(expert);
       groups.push_back(group_begin);
       groups.push_back(group_rows);
-      groups.push_back(task_kind);
+      groups.push_back(0);
       for (int row = group_begin; row < group_begin + group_rows; ++row) {
         ++visits[row];
       }
@@ -434,7 +483,7 @@ bool run_case(const Shape& shape, Routing routing, bool gather, bool use_bias,
   return pass;
 }
 
-bool run_bucket_task_kind_case(hipStream_t stream) {
+bool run_bucket_descriptor_case(hipStream_t stream) {
   constexpr int counts[] = {1, 2, 7, 8, 15, 16, 31, 32, 63, 64, 65};
   constexpr int experts = sizeof(counts) / sizeof(counts[0]);
   int pairs = 0;
@@ -456,13 +505,10 @@ bool run_bucket_task_kind_case(hipStream_t stream) {
          row += kMaxRowsPerGroup) {
       const int rows = std::min(kMaxRowsPerGroup,
                                 expected_offsets[expert + 1] - row);
-      const int task_kind = rows <= 7 ? kTaskGemv
-                            : rows <= 31 ? kTaskWmma16
-                                         : kTaskWmma64;
       expected_groups.push_back(expert);
       expected_groups.push_back(row);
       expected_groups.push_back(rows);
-      expected_groups.push_back(task_kind);
+      expected_groups.push_back(0);
     }
   }
 
@@ -517,22 +563,49 @@ bool run_bucket_task_kind_case(hipStream_t stream) {
   HIP_CHECK(hipMemcpy(&got_fc2_queue, d_fc2_queue.get(), sizeof(uint32_t),
                       hipMemcpyDeviceToHost));
 
-  bool saw_kind[3] = {false, false, false};
+  bool reserved_zero = true;
   for (size_t group = 0; group < got_groups.size() / 4; ++group) {
-    const int kind = got_groups[group * 4 + 3];
-    if (kind >= kTaskGemv && kind <= kTaskWmma64) saw_kind[kind] = true;
+    reserved_zero = reserved_zero && got_groups[group * 4 + 3] == 0;
   }
   const bool pass = got_counts == expected_counts &&
                     got_offsets == expected_offsets &&
                     got_group_count ==
                         static_cast<int32_t>(expected_groups.size() / 4) &&
                     got_groups == expected_groups && got_fc1_queue == 0 &&
-                    got_fc2_queue == 0 && saw_kind[kTaskGemv] &&
-                    saw_kind[kTaskWmma16] && saw_kind[kTaskWmma64];
+                    got_fc2_queue == 0 && reserved_zero;
   std::cout << (pass ? "PASS" : "FAIL") << " relL2=0 n=" << pairs
             << " shape=adaptive_descriptors maxAbs=0 metadata="
             << (pass ? "PASS" : "FAIL")
-            << " task_kinds=gemv,wmma16,wmma64\n";
+            << " descriptor_field=reserved_zero\n";
+  return pass;
+}
+
+bool run_task_policy_case(bool fc1) {
+  const TaskPolicyExpectation expected = expected_task_policy(fc1);
+  bool pass = true;
+  bool saw_kind[3] = {false, false, false};
+  for (int rows = 1; rows <= kMaxRowsPerGroup; ++rows) {
+    int32_t policy_id = -1;
+    int32_t task_kind = -1;
+    const int status = hip_qmoe_ragged_matmul_nbits_get_task_kind(
+        fc1 ? 1 : 0, rows, &policy_id, &task_kind);
+    const int expected_kind =
+        rows <= expected.gemv_max_rows
+            ? kTaskGemv
+            : rows <= expected.wmma16_max_rows ? kTaskWmma16 : kTaskWmma64;
+    pass = pass && status == static_cast<int>(hipSuccess) &&
+           policy_id == expected.id && task_kind == expected_kind;
+    if (task_kind >= kTaskGemv && task_kind <= kTaskWmma64) {
+      saw_kind[task_kind] = true;
+    }
+  }
+  pass = pass && saw_kind[kTaskGemv] && saw_kind[kTaskWmma16] &&
+         saw_kind[kTaskWmma64];
+  std::cout << (pass ? "PASS" : "FAIL") << " relL2=0 n=64"
+            << " shape=task_policy stage=" << (fc1 ? "fc1" : "fc2")
+            << " policy=" << expected.name
+            << " boundaries=" << expected.gemv_max_rows << ','
+            << expected.wmma16_max_rows << ",64\n";
   return pass;
 }
 
@@ -549,6 +622,37 @@ bool run_launcher_grid_case() {
   bool saw_occupancy_bound = false;
   int32_t expected_cu_count = 0;
   int32_t expected_resident_blocks = 0;
+  const char* block_override =
+      std::getenv("HIPDNN_QMOE_RAGGED_GRID_BLOCKS");
+  const char* factor_override =
+      std::getenv("HIPDNN_QMOE_RAGGED_GRID_FACTOR");
+  const int valid_blocks[] = {20, 40, 80, 160, 320, 640, 4096};
+  const int valid_factors[] = {1, 2, 4, 8, 16};
+  auto parse_candidate = [](const char* text, const int* candidates,
+                            size_t candidate_count) {
+    if (!text || !*text) {
+      return 0;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+      return 0;
+    }
+    const int value = static_cast<int>(parsed);
+    return std::find(candidates, candidates + candidate_count, value) !=
+                   candidates + candidate_count
+               ? value
+               : 0;
+  };
+  const int expected_blocks =
+      parse_candidate(block_override, valid_blocks,
+                      sizeof(valid_blocks) / sizeof(valid_blocks[0]));
+  const int expected_factor =
+      block_override
+          ? 0
+          : parse_candidate(factor_override, valid_factors,
+                            sizeof(valid_factors) / sizeof(valid_factors[0]));
   for (const LaunchShape& shape : shapes) {
     int32_t cu_count = 0;
     int32_t resident_blocks = 0;
@@ -560,14 +664,19 @@ bool run_launcher_grid_case() {
     const int64_t expected_tasks = shape.rows * ((shape.n + 63) / 64);
     const int64_t resident_capacity =
         static_cast<int64_t>(cu_count) * resident_blocks;
-    const int64_t expected_grid =
-        std::min(expected_tasks, resident_capacity);
+    const int production_factor = shape.rows >= 512 ? 2 : 1;
+    int64_t expected_limit = resident_capacity * production_factor;
+    if (expected_blocks > 0) {
+      expected_limit = expected_blocks;
+    } else if (expected_factor > 0) {
+      expected_limit *= expected_factor;
+    }
+    const int64_t expected_grid = std::min(expected_tasks, expected_limit);
     const bool shape_pass = status == static_cast<int>(hipSuccess) &&
                             cu_count > 0 && resident_blocks > 0 &&
                             upper_tasks == expected_tasks &&
                             grid_blocks == expected_grid &&
-                            grid_blocks <= upper_tasks &&
-                            grid_blocks <= resident_capacity;
+                            grid_blocks <= upper_tasks;
     if (expected_cu_count == 0) {
       expected_cu_count = cu_count;
       expected_resident_blocks = resident_blocks;
@@ -584,6 +693,7 @@ bool run_launcher_grid_case() {
               << " cu_count=" << cu_count
               << " resident_blocks_per_cu=" << resident_blocks
               << " occupancy_cap=" << resident_capacity
+              << " expected_grid_limit=" << expected_limit
               << " grid_blocks=" << grid_blocks
               << " upper_tasks=" << upper_tasks << '\n';
   }
@@ -740,13 +850,10 @@ bool run_pipeline_case(hipStream_t stream) {
          row += kMaxRowsPerGroup) {
       const int rows = std::min(kMaxRowsPerGroup,
                                 expected_offsets[expert + 1] - row);
-      const int task_kind = rows <= 7 ? kTaskGemv
-                            : rows <= 31 ? kTaskWmma16
-                                         : kTaskWmma64;
       expected_groups.push_back(expert);
       expected_groups.push_back(row);
       expected_groups.push_back(rows);
-      expected_groups.push_back(task_kind);
+      expected_groups.push_back(0);
     }
   }
 
@@ -937,9 +1044,15 @@ bool run_pipeline_case(hipStream_t stream) {
       got_pair_to_sorted == expected_pair_to_sorted &&
       got_group_count == static_cast<int32_t>(expected_groups.size() / 4) &&
       got_groups == expected_groups;
-  // Queue heads count claimed tasks after the two ragged launches. Their
-  // non-zero values also prove that each stage used its own queue.
-  const bool queues_ok = got_fc1_queue > 0 && got_fc2_queue > 0;
+  const QueuePolicyExpectation queue_policy = expected_queue_policy();
+  // Atomic policies advance each independently reset queue in exact chunk
+  // multiples. Grid-stride deliberately leaves both queue heads at zero.
+  const auto queue_ok = [&queue_policy](uint32_t value) {
+    return queue_policy.grid_stride
+               ? value == 0
+               : value > 0 && value % queue_policy.chunk == 0;
+  };
+  const bool queues_ok = queue_ok(got_fc1_queue) && queue_ok(got_fc2_queue);
   const Metrics metrics = compare(first_output, expected_output);
   const bool pass = metadata_ok && queues_ok && deterministic && metrics.finite &&
                     metrics.max_abs <= 0.05 && metrics.rel_l2 <= 0.01;
@@ -949,31 +1062,47 @@ bool run_pipeline_case(hipStream_t stream) {
             << " metadata=" << (metadata_ok ? "PASS" : "FAIL")
             << " deterministic=" << (deterministic ? "PASS" : "FAIL")
             << " queues=" << (queues_ok ? "PASS" : "FAIL")
+            << " queue_policy=" << queue_policy.name
+            << " fc1_queue_head=" << got_fc1_queue
+            << " fc2_queue_head=" << got_fc2_queue
             << " launches=fc1:1,fc2:1\n";
   return pass;
 }
 
-int parse_coverage(int argc, char** argv) {
+struct Options {
   int coverage = 3;
+  bool launcher_grid_only = false;
+};
+
+bool parse_options(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
     const std::string argument = argv[i];
     if (argument == "--coverage" && i + 1 < argc) {
-      coverage = std::atoi(argv[++i]);
+      options->coverage = std::atoi(argv[++i]);
+    } else if (argument == "--launcher-grid-only") {
+      options->launcher_grid_only = true;
     } else {
-      std::cerr << "usage: " << argv[0] << " [--coverage 1|2|3]\n";
-      return -1;
+      std::cerr << "usage: " << argv[0]
+                << " [--coverage 1|2|3] [--launcher-grid-only]\n";
+      return false;
     }
   }
-  return coverage >= 1 && coverage <= 3 ? coverage : -1;
+  return options->coverage >= 1 && options->coverage <= 3;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-  const int coverage = parse_coverage(argc, argv);
-  if (coverage < 0) {
+  Options options;
+  if (!parse_options(argc, argv, &options)) {
     return 2;
   }
+  if (options.launcher_grid_only) {
+    const bool pass = run_launcher_grid_case();
+    std::cout << (pass ? "ALL PASS" : "SOME FAIL") << '\n';
+    return pass ? 0 : 1;
+  }
+  const int coverage = options.coverage;
 
   int shape_count = 0;
   for (const Shape& shape : kShapes) {
@@ -986,17 +1115,20 @@ int main(int argc, char** argv) {
           ? static_cast<int>(sizeof(kAdaptiveShapes) / sizeof(kAdaptiveShapes[0]))
           : 0;
   const int descriptor_cases = coverage == 3 ? 1 : 0;
+  constexpr int task_policy_cases = 2;
   constexpr int launcher_cases = 1;
   std::cout << "qmoe_ragged_mm coverage=" << coverage
             << " cases=" << shape_count * category_count + model_shape_cases +
                                adaptive_shape_cases + descriptor_cases +
-                               launcher_cases
+                               task_policy_cases + launcher_cases
             << '\n';
 
   hipStream_t stream = nullptr;
   HIP_CHECK(hipStreamCreate(&stream));
   bool all_pass = true;
   all_pass = run_launcher_grid_case() && all_pass;
+  all_pass = run_task_policy_case(/*fc1=*/true) && all_pass;
+  all_pass = run_task_policy_case(/*fc1=*/false) && all_pass;
   for (const Shape& shape : kShapes) {
     if (shape.min_coverage > coverage) {
       continue;
@@ -1015,7 +1147,7 @@ int main(int argc, char** argv) {
     }
   }
   if (coverage == 3) {
-    all_pass = run_bucket_task_kind_case(stream) && all_pass;
+    all_pass = run_bucket_descriptor_case(stream) && all_pass;
     for (const Shape& shape : kAdaptiveShapes) {
       all_pass = run_case(shape, Routing::Balanced,
                           /*gather=*/(shape.rows & 1) != 0,

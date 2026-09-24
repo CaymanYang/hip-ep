@@ -6,7 +6,7 @@
  *
  * One launch covers every active expert.  Work is described by compact
  * row-groups produced by qmoe's bucket kernel:
- *   groups[g] = {expert_id, sorted_row_begin, row_count, task_kind}.
+ *   groups[g] = {expert_id, sorted_row_begin, row_count, reserved}.
  * Persistent blocks dequeue (group, N-tile) tasks from a device counter, so
  * the host never reads expert counts and never launches one GEMM per expert.
  */
@@ -20,8 +20,11 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace {
@@ -35,12 +38,222 @@ constexpr int kThreadsPerBlock = 128;
 constexpr int kComputeUnitsPerWgp = 2;
 constexpr int kMaxTopK = 16;
 constexpr int kGemvTileN = 16;
+constexpr int64_t kTwoWindowMinRows = 512;
+
+constexpr int kGridBlockCandidates[] = {20, 40, 80, 160, 320, 640, 4096};
+constexpr int kGridFactorCandidates[] = {1, 2, 4, 8, 16};
+
+enum class RaggedGridOverrideKind {
+  kDefault,
+  kAbsoluteBlocks,
+  kOccupancyFactor,
+};
+
+struct RaggedGridOverride {
+  RaggedGridOverrideKind kind;
+  int value;
+};
+
+enum class RaggedQueuePolicy : int {
+  kAtomic1,
+  kChunk2,
+  kChunk4,
+  kChunk8,
+  kGridStride,
+};
+
+enum class RaggedTaskPolicy : int {
+  kP0Current = 0,
+  kP1EarlyWmma16 = 1,
+  kP2EarlyWmma64 = 2,
+  kP3EarlyBoth = 3,
+};
+
+struct RaggedTaskPolicyConfig {
+  RaggedTaskPolicy policy;
+  int gemv_max_rows;
+  int wmma16_max_rows;
+  const char* name;
+};
 
 enum RaggedTaskKind : int {
   kTaskGemv = 0,
   kTaskWmma16 = 1,
   kTaskWmma64 = 2,
 };
+
+template <size_t N>
+bool is_grid_candidate(int value, const int (&candidates)[N]) {
+  return std::find(candidates, candidates + N, value) != candidates + N;
+}
+
+bool parse_positive_int(const char* text, int* value) {
+  if (!text || !*text || !value) {
+    return false;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long parsed = std::strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed <= 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    return false;
+  }
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+RaggedGridOverride load_ragged_grid_override() {
+  const char* blocks = std::getenv("HIPDNN_QMOE_RAGGED_GRID_BLOCKS");
+  if (blocks) {
+    int value = 0;
+    if (parse_positive_int(blocks, &value) &&
+        is_grid_candidate(value, kGridBlockCandidates)) {
+      fprintf(stderr,
+              "[custom_kernels] qmoe ragged benchmark grid override: "
+              "HIPDNN_QMOE_RAGGED_GRID_BLOCKS=%d\n",
+              value);
+      return {RaggedGridOverrideKind::kAbsoluteBlocks, value};
+    }
+    fprintf(stderr,
+            "[custom_kernels] invalid "
+            "HIPDNN_QMOE_RAGGED_GRID_BLOCKS='%s'; expected one of "
+            "20,40,80,160,320,640,4096; using the production shape "
+            "policy\n",
+            blocks);
+    return {RaggedGridOverrideKind::kDefault, 1};
+  }
+
+  const char* factor = std::getenv("HIPDNN_QMOE_RAGGED_GRID_FACTOR");
+  if (factor) {
+    int value = 0;
+    if (parse_positive_int(factor, &value) &&
+        is_grid_candidate(value, kGridFactorCandidates)) {
+      fprintf(stderr,
+              "[custom_kernels] qmoe ragged benchmark grid override: "
+              "HIPDNN_QMOE_RAGGED_GRID_FACTOR=%d\n",
+              value);
+      return {RaggedGridOverrideKind::kOccupancyFactor, value};
+    }
+    fprintf(stderr,
+            "[custom_kernels] invalid HIPDNN_QMOE_RAGGED_GRID_FACTOR='%s'; "
+            "expected one of 1,2,4,8,16; using the production shape "
+            "policy\n",
+            factor);
+  }
+  return {RaggedGridOverrideKind::kDefault, 1};
+}
+
+const RaggedGridOverride& get_ragged_grid_override() {
+  // Benchmark-only knobs are process-latched so production launches do not
+  // repeatedly enter the CRT environment lock. Absolute blocks take
+  // precedence whenever that variable is present, including invalid values.
+  static const RaggedGridOverride grid_override = load_ragged_grid_override();
+  return grid_override;
+}
+
+RaggedQueuePolicy load_ragged_queue_policy() {
+  const char* policy = std::getenv("HIPDNN_QMOE_RAGGED_QUEUE_POLICY");
+  if (!policy) {
+    return RaggedQueuePolicy::kAtomic1;
+  }
+  if (std::strcmp(policy, "atomic1") == 0) {
+    return RaggedQueuePolicy::kAtomic1;
+  }
+  if (std::strcmp(policy, "chunk2") == 0) {
+    return RaggedQueuePolicy::kChunk2;
+  }
+  if (std::strcmp(policy, "chunk4") == 0) {
+    return RaggedQueuePolicy::kChunk4;
+  }
+  if (std::strcmp(policy, "chunk8") == 0) {
+    return RaggedQueuePolicy::kChunk8;
+  }
+  if (std::strcmp(policy, "grid-stride") == 0) {
+    return RaggedQueuePolicy::kGridStride;
+  }
+  fprintf(stderr,
+          "[custom_kernels] invalid HIPDNN_QMOE_RAGGED_QUEUE_POLICY='%s'; "
+          "expected atomic1,chunk2,chunk4,chunk8,grid-stride; using atomic1\n",
+          policy);
+  return RaggedQueuePolicy::kAtomic1;
+}
+
+const RaggedQueuePolicy& get_ragged_queue_policy() {
+  // Benchmark-only policy selection is process-latched for the same reason as
+  // the grid override: do not enter the CRT environment lock on every launch.
+  static const RaggedQueuePolicy queue_policy = load_ragged_queue_policy();
+  return queue_policy;
+}
+
+RaggedTaskPolicyConfig load_ragged_task_policy(const char* env_name,
+                                                const char* stage_name) {
+  const char* policy = std::getenv(env_name);
+  if (!policy || std::strcmp(policy, "p0-current") == 0) {
+    return {RaggedTaskPolicy::kP0Current, 7, 31, "p0-current"};
+  }
+  if (std::strcmp(policy, "p1-early-wmma16") == 0) {
+    fprintf(stderr,
+            "[custom_kernels] qmoe ragged benchmark %s task policy "
+            "override: %s=%s\n",
+            stage_name, env_name, policy);
+    return {RaggedTaskPolicy::kP1EarlyWmma16, 3, 31,
+            "p1-early-wmma16"};
+  }
+  if (std::strcmp(policy, "p2-early-wmma64") == 0) {
+    fprintf(stderr,
+            "[custom_kernels] qmoe ragged benchmark %s task policy "
+            "override: %s=%s\n",
+            stage_name, env_name, policy);
+    return {RaggedTaskPolicy::kP2EarlyWmma64, 7, 15,
+            "p2-early-wmma64"};
+  }
+  if (std::strcmp(policy, "p3-early-both") == 0) {
+    fprintf(stderr,
+            "[custom_kernels] qmoe ragged benchmark %s task policy "
+            "override: %s=%s\n",
+            stage_name, env_name, policy);
+    return {RaggedTaskPolicy::kP3EarlyBoth, 3, 15, "p3-early-both"};
+  }
+  fprintf(stderr,
+          "[custom_kernels] invalid %s='%s'; expected one of "
+          "p0-current,p1-early-wmma16,p2-early-wmma64,p3-early-both; "
+          "using p0-current\n",
+          env_name, policy);
+  return {RaggedTaskPolicy::kP0Current, 7, 31, "p0-current"};
+}
+
+const RaggedTaskPolicyConfig& get_ragged_fc1_task_policy() {
+  // Process-latched benchmark override. Production defaults to P0.
+  static const RaggedTaskPolicyConfig policy = load_ragged_task_policy(
+      "HIPDNN_QMOE_RAGGED_FC1_TASK_POLICY", "FC1");
+  return policy;
+}
+
+const RaggedTaskPolicyConfig& get_ragged_fc2_task_policy() {
+  // Process-latched independently from FC1 so every Bxy bundle is reproducible.
+  static const RaggedTaskPolicyConfig policy = load_ragged_task_policy(
+      "HIPDNN_QMOE_RAGGED_FC2_TASK_POLICY", "FC2");
+  return policy;
+}
+
+__host__ __device__ __forceinline__ int select_ragged_task_kind(
+    int row_count, int gemv_max_rows, int wmma16_max_rows) {
+  return row_count <= gemv_max_rows
+             ? kTaskGemv
+             : row_count <= wmma16_max_rows ? kTaskWmma16 : kTaskWmma64;
+}
+
+template <RaggedQueuePolicy Policy>
+constexpr uint32_t queue_chunk_size() {
+  if constexpr (Policy == RaggedQueuePolicy::kChunk2) {
+    return 2;
+  } else if constexpr (Policy == RaggedQueuePolicy::kChunk4) {
+    return 4;
+  } else if constexpr (Policy == RaggedQueuePolicy::kChunk8) {
+    return 8;
+  }
+  return 1;
+}
 
 __device__ __forceinline__ void qmoe_wmma16_task(
     const _Float16* input, const int32_t* input_row_ids,
@@ -238,13 +451,14 @@ __device__ __forceinline__ void qmoe_gemv_task(
 }
 
 // `groups` is a flat int32 array, four values per group:
-//   [expert_id, sorted_row_begin, row_count, task_kind].
+//   [expert_id, sorted_row_begin, row_count, reserved].
 // `input_row_ids == nullptr` means input is already in sorted-row order;
 // otherwise input_row_ids[sorted_row] selects the source row (FC1 gather).
 //
 // One persistent workgroup owns one descriptor x 64-column task. Small groups
 // use a wave-reduction GEMV; medium/large groups use the shared MatMulNBits
 // double-buffered WMMA core. Every task kind uses the same 128-thread block.
+template <RaggedQueuePolicy QueuePolicy>
 __global__ __attribute__((amdgpu_flat_work_group_size(kThreadsPerBlock,
                                                        kThreadsPerBlock)))
 void qmoe_ragged_matmul_nbits_adaptive_kernel(
@@ -262,7 +476,9 @@ void qmoe_ragged_matmul_nbits_adaptive_kernel(
     int64_t num_experts,
     int64_t N,
     int64_t K,
-    int64_t block_size) {
+    int64_t block_size,
+    int gemv_max_rows,
+    int wmma16_max_rows) {
   __shared__ uint32_t task_id_shared;
   __shared__ int group_count_shared;
 
@@ -278,13 +494,27 @@ void qmoe_ragged_matmul_nbits_adaptive_kernel(
       static_cast<uint32_t>(group_count_shared) *
       static_cast<uint32_t>(n_tiles);
 
-  while (true) {
-    if (tid == 0) {
-      task_id_shared = atomicAdd(queue_head, 1u);
-    }
-    __syncthreads();
+  constexpr uint32_t kQueueChunk = queue_chunk_size<QueuePolicy>();
+  uint32_t chunk_offset = kQueueChunk;
+  uint32_t grid_stride_task = static_cast<uint32_t>(blockIdx.x);
 
-    const uint32_t task_id = task_id_shared;
+  while (true) {
+    uint32_t task_id = 0;
+    if constexpr (QueuePolicy == RaggedQueuePolicy::kGridStride) {
+      task_id = grid_stride_task;
+      grid_stride_task += static_cast<uint32_t>(gridDim.x);
+    } else {
+      if (chunk_offset == kQueueChunk) {
+        if (tid == 0) {
+          task_id_shared = atomicAdd(queue_head, kQueueChunk);
+        }
+        __syncthreads();
+        chunk_offset = 0;
+      }
+      task_id = task_id_shared + chunk_offset;
+      ++chunk_offset;
+    }
+
     if (task_id >= task_count) {
       return;
     }
@@ -294,7 +524,8 @@ void qmoe_ragged_matmul_nbits_adaptive_kernel(
     const int expert = groups[group_id * 4 + 0];
     const int row_begin = groups[group_id * 4 + 1];
     const int row_count = groups[group_id * 4 + 2];
-    const int task_kind = groups[group_id * 4 + 3];
+    const int task_kind = select_ragged_task_kind(
+        row_count, gemv_max_rows, wmma16_max_rows);
     const int n_begin = n_tile * kColsPerBlock;
     const bool valid_expert = expert >= 0 && expert < num_experts;
 
@@ -340,7 +571,45 @@ struct RaggedLaunchConfig {
   int resident_blocks_per_cu;
   int grid_blocks;
   int64_t upper_tasks;
+  RaggedQueuePolicy queue_policy;
 };
+
+hipError_t get_ragged_resident_blocks(RaggedQueuePolicy policy,
+                                      int* resident_blocks_per_cu) {
+  switch (policy) {
+    case RaggedQueuePolicy::kAtomic1:
+      return hipOccupancyMaxActiveBlocksPerMultiprocessor(
+          resident_blocks_per_cu,
+          qmoe_ragged_matmul_nbits_adaptive_kernel<
+              RaggedQueuePolicy::kAtomic1>,
+          kThreadsPerBlock, /*dynamicSMemSize=*/0);
+    case RaggedQueuePolicy::kChunk2:
+      return hipOccupancyMaxActiveBlocksPerMultiprocessor(
+          resident_blocks_per_cu,
+          qmoe_ragged_matmul_nbits_adaptive_kernel<
+              RaggedQueuePolicy::kChunk2>,
+          kThreadsPerBlock, /*dynamicSMemSize=*/0);
+    case RaggedQueuePolicy::kChunk4:
+      return hipOccupancyMaxActiveBlocksPerMultiprocessor(
+          resident_blocks_per_cu,
+          qmoe_ragged_matmul_nbits_adaptive_kernel<
+              RaggedQueuePolicy::kChunk4>,
+          kThreadsPerBlock, /*dynamicSMemSize=*/0);
+    case RaggedQueuePolicy::kChunk8:
+      return hipOccupancyMaxActiveBlocksPerMultiprocessor(
+          resident_blocks_per_cu,
+          qmoe_ragged_matmul_nbits_adaptive_kernel<
+              RaggedQueuePolicy::kChunk8>,
+          kThreadsPerBlock, /*dynamicSMemSize=*/0);
+    case RaggedQueuePolicy::kGridStride:
+      return hipOccupancyMaxActiveBlocksPerMultiprocessor(
+          resident_blocks_per_cu,
+          qmoe_ragged_matmul_nbits_adaptive_kernel<
+              RaggedQueuePolicy::kGridStride>,
+          kThreadsPerBlock, /*dynamicSMemSize=*/0);
+  }
+  return hipErrorInvalidValue;
+}
 
 hipError_t get_ragged_launch_config(int64_t total_rows, int64_t N,
                                     RaggedLaunchConfig* config) {
@@ -364,10 +633,9 @@ hipError_t get_ragged_launch_config(int64_t total_rows, int64_t N,
     return err;
   }
 
+  const RaggedQueuePolicy queue_policy = get_ragged_queue_policy();
   int resident_blocks_per_cu = 0;
-  err = hipOccupancyMaxActiveBlocksPerMultiprocessor(
-      &resident_blocks_per_cu, qmoe_ragged_matmul_nbits_adaptive_kernel,
-      kThreadsPerBlock, /*dynamicSMemSize=*/0);
+  err = get_ragged_resident_blocks(queue_policy, &resident_blocks_per_cu);
   if (err != hipSuccess) {
     return err;
   }
@@ -380,12 +648,56 @@ hipError_t get_ragged_launch_config(int64_t total_rows, int64_t N,
       properties.multiProcessorCount * kComputeUnitsPerWgp;
   const int64_t resident_capacity =
       static_cast<int64_t>(device_cu_count) * resident_blocks_per_cu;
+  const RaggedGridOverride& grid_override = get_ragged_grid_override();
+  const int production_factor = total_rows >= kTwoWindowMinRows ? 2 : 1;
+  int64_t grid_limit = resident_capacity;
+  if (grid_override.kind == RaggedGridOverrideKind::kAbsoluteBlocks) {
+    grid_limit = grid_override.value;
+  } else {
+    const int factor =
+        grid_override.kind == RaggedGridOverrideKind::kOccupancyFactor
+            ? grid_override.value
+            : production_factor;
+    if (resident_capacity > std::numeric_limits<int64_t>::max() /
+                                factor) {
+      grid_limit = std::numeric_limits<int64_t>::max();
+    } else {
+      grid_limit = resident_capacity * factor;
+    }
+  }
   config->device_cu_count = device_cu_count;
   config->resident_blocks_per_cu = resident_blocks_per_cu;
-  config->grid_blocks =
-      static_cast<int>(std::min(upper_tasks, resident_capacity));
+  config->grid_blocks = static_cast<int>(std::min(
+      std::min(upper_tasks, grid_limit),
+      static_cast<int64_t>(std::numeric_limits<int>::max())));
   config->upper_tasks = upper_tasks;
+  config->queue_policy = queue_policy;
   return hipSuccess;
+}
+
+template <RaggedQueuePolicy QueuePolicy>
+hipError_t launch_ragged_matmul_nbits(
+    hipStream_t stream, const void* input, const void* input_row_ids,
+    const void* row_groups, const void* row_group_count, void* queue_head,
+    const void* weights, const void* scales, const void* zero_points_u8,
+    const void* bias, void* output, int64_t total_rows, int64_t num_experts,
+    int64_t N, int64_t K, int64_t block_size, int grid_blocks,
+    int gemv_max_rows, int wmma16_max_rows) {
+  hipLaunchKernelGGL(
+      qmoe_ragged_matmul_nbits_adaptive_kernel<QueuePolicy>,
+      dim3(grid_blocks), dim3(kThreadsPerBlock), 0, stream,
+      static_cast<const _Float16 *>(input),
+      static_cast<const int32_t *>(input_row_ids),
+      static_cast<const int32_t *>(row_groups),
+      static_cast<const int32_t *>(row_group_count),
+      static_cast<uint32_t *>(queue_head),
+      static_cast<const uint8_t *>(weights),
+      static_cast<const _Float16 *>(scales),
+      static_cast<const uint8_t *>(zero_points_u8),
+      static_cast<const _Float16 *>(bias), static_cast<_Float16 *>(output),
+      total_rows, num_experts, N, K, block_size, gemv_max_rows,
+      wmma16_max_rows);
+  return hipGetLastError();
 }
 
 __global__ void qmoe_reduce_sorted_pairs_kernel(
@@ -461,6 +773,22 @@ extern "C" int hip_qmoe_ragged_matmul_nbits_get_launch_config(
   return static_cast<int>(hipSuccess);
 }
 
+extern "C" int hip_qmoe_ragged_matmul_nbits_get_task_kind(
+    int64_t is_fc1, int64_t row_count, int32_t* policy_id,
+    int32_t* task_kind) {
+  if ((is_fc1 != 0 && is_fc1 != 1) || row_count <= 0 ||
+      row_count > kRowsPerLargeGroup || !policy_id || !task_kind) {
+    return -1;
+  }
+  const RaggedTaskPolicyConfig& policy =
+      is_fc1 ? get_ragged_fc1_task_policy() : get_ragged_fc2_task_policy();
+  *policy_id = static_cast<int32_t>(policy.policy);
+  *task_kind = select_ragged_task_kind(
+      static_cast<int>(row_count), policy.gemv_max_rows,
+      policy.wmma16_max_rows);
+  return static_cast<int>(hipSuccess);
+}
+
 extern "C" int hip_qmoe_ragged_matmul_nbits(
     void *stream, const void *input, const void *input_row_ids,
     const void *row_groups, const void *row_group_count, void *queue_head,
@@ -502,21 +830,46 @@ extern "C" int hip_qmoe_ragged_matmul_nbits(
     return static_cast<int>(err);
   }
   hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-  hipLaunchKernelGGL(
-      qmoe_ragged_matmul_nbits_adaptive_kernel, dim3(config.grid_blocks),
-      dim3(kThreadsPerBlock), 0,
-      hip_stream, static_cast<const _Float16 *>(input),
-      static_cast<const int32_t *>(input_row_ids),
-      static_cast<const int32_t *>(row_groups),
-      static_cast<const int32_t *>(row_group_count),
-      static_cast<uint32_t *>(queue_head),
-      static_cast<const uint8_t *>(weights),
-      static_cast<const _Float16 *>(scales),
-      static_cast<const uint8_t *>(zero_points_u8),
-      static_cast<const _Float16 *>(bias), static_cast<_Float16 *>(output),
-      total_rows, num_experts, N, K, block_size);
-
-  err = hipGetLastError();
+  const RaggedTaskPolicyConfig& task_policy = input_row_ids
+                                                   ? get_ragged_fc1_task_policy()
+                                                   : get_ragged_fc2_task_policy();
+  switch (config.queue_policy) {
+    case RaggedQueuePolicy::kAtomic1:
+      err = launch_ragged_matmul_nbits<RaggedQueuePolicy::kAtomic1>(
+          hip_stream, input, input_row_ids, row_groups, row_group_count,
+          queue_head, weights, scales, zero_points_u8, bias, output, total_rows,
+          num_experts, N, K, block_size, config.grid_blocks,
+          task_policy.gemv_max_rows, task_policy.wmma16_max_rows);
+      break;
+    case RaggedQueuePolicy::kChunk2:
+      err = launch_ragged_matmul_nbits<RaggedQueuePolicy::kChunk2>(
+          hip_stream, input, input_row_ids, row_groups, row_group_count,
+          queue_head, weights, scales, zero_points_u8, bias, output, total_rows,
+          num_experts, N, K, block_size, config.grid_blocks,
+          task_policy.gemv_max_rows, task_policy.wmma16_max_rows);
+      break;
+    case RaggedQueuePolicy::kChunk4:
+      err = launch_ragged_matmul_nbits<RaggedQueuePolicy::kChunk4>(
+          hip_stream, input, input_row_ids, row_groups, row_group_count,
+          queue_head, weights, scales, zero_points_u8, bias, output, total_rows,
+          num_experts, N, K, block_size, config.grid_blocks,
+          task_policy.gemv_max_rows, task_policy.wmma16_max_rows);
+      break;
+    case RaggedQueuePolicy::kChunk8:
+      err = launch_ragged_matmul_nbits<RaggedQueuePolicy::kChunk8>(
+          hip_stream, input, input_row_ids, row_groups, row_group_count,
+          queue_head, weights, scales, zero_points_u8, bias, output, total_rows,
+          num_experts, N, K, block_size, config.grid_blocks,
+          task_policy.gemv_max_rows, task_policy.wmma16_max_rows);
+      break;
+    case RaggedQueuePolicy::kGridStride:
+      err = launch_ragged_matmul_nbits<RaggedQueuePolicy::kGridStride>(
+          hip_stream, input, input_row_ids, row_groups, row_group_count,
+          queue_head, weights, scales, zero_points_u8, bias, output, total_rows,
+          num_experts, N, K, block_size, config.grid_blocks,
+          task_policy.gemv_max_rows, task_policy.wmma16_max_rows);
+      break;
+  }
   if (err != hipSuccess) {
     fprintf(stderr,
             "[custom_kernels] hip_qmoe_ragged_matmul_nbits launch failed: "

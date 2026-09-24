@@ -2499,10 +2499,11 @@ HIP_KERNEL_API int hip_qmoe_ragged_matmul_nbits(
     int64_t block_size,
     int64_t element_size_bytes);
 
-/* Query the exact grid policy used by hip_qmoe_ragged_matmul_nbits. The
- * returned grid is min(upper_tasks, device_cu_count *
- * resident_blocks_per_cu), where occupancy is queried for the adaptive
- * 128-thread kernel on the current HIP device. Output pointers are host-side.
+/* Query the exact grid policy used by hip_qmoe_ragged_matmul_nbits. With no
+ * benchmark override, the returned grid is min(upper_tasks, occupancy_window
+ * * factor), where factor is 1 below 512 total rows and 2 otherwise, and the
+ * occupancy window is queried for the adaptive 128-thread kernel on the
+ * current HIP device. Output pointers are host-side.
  */
 HIP_KERNEL_API int hip_qmoe_ragged_matmul_nbits_get_launch_config(
     int64_t total_rows,
@@ -2511,6 +2512,18 @@ HIP_KERNEL_API int hip_qmoe_ragged_matmul_nbits_get_launch_config(
     int32_t* resident_blocks_per_cu,
     int32_t* grid_blocks,
     int64_t* upper_tasks);
+
+/* Query the process-latched stage policy's task kind for a row group.
+ * is_fc1=1 selects the gather/FC1 policy and is_fc1=0 the contiguous/FC2
+ * policy. policy_id is P0..P3 and task_kind is GEMV=0, WMMA16=1, WMMA64=2.
+ * This internal query keeps the standalone boundary/fallback test aligned with
+ * the exact selector used by the production kernel.
+ */
+HIP_KERNEL_API int hip_qmoe_ragged_matmul_nbits_get_task_kind(
+    int64_t is_fc1,
+    int64_t row_count,
+    int32_t* policy_id,
+    int32_t* task_kind);
 
 /* Deterministic routed-pair reduction. Reorders each token's k contributions
  * by ascending expert id and rounds to fp16 after every addition, matching the
