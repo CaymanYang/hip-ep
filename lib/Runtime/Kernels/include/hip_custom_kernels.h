@@ -2447,6 +2447,87 @@ HIP_KERNEL_API int hip_qmoe_bucket_tokens(
     int64_t k,
     int64_t element_size_bytes);
 
+/* Extended bucket output for the device-driven prefill path. In addition to
+ * the regular sorted buffers, writes:
+ *   pair_to_sorted [num_tokens*k] : inverse map for deterministic reduction
+ *   row_groups     [num_tokens*k,4]: {expert,row_begin,row_count,task_kind},
+ *                                    packed densely with row_count <= 64;
+ *                                    kinds are GEMV=0, WMMA16=1, WMMA64=2
+ *   row_group_count[1]            : number of valid row_groups
+ *   fc1/fc2_queue_head[1]         : initialized to zero for persistent MM
+ */
+HIP_KERNEL_API int hip_qmoe_bucket_tokens_ragged(
+    void* stream,
+    const void* expert_indices,
+    const void* expert_weights,
+    void* expert_counts,
+    void* expert_offsets,
+    void* sorted_token_ids,
+    void* sorted_weights,
+    void* pair_to_sorted,
+    void* row_groups,
+    void* row_group_count,
+    void* fc1_queue_head,
+    void* fc2_queue_head,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t k,
+    int64_t row_group_size,
+    int64_t element_size_bytes);
+
+/* One-launch ragged W4A16 MatMulNBits over every row group/expert.
+ * input_row_ids may be null for already-sorted input rows; otherwise it maps
+ * each sorted output row to a source input row (FC1 fused gather).
+ * zero_points_u8 is already unpacked [E,N,ceil(K/block_size)] or null.
+ */
+HIP_KERNEL_API int hip_qmoe_ragged_matmul_nbits(
+    void* stream,
+    const void* input,
+    const void* input_row_ids,
+    const void* row_groups,
+    const void* row_group_count,
+    void* queue_head,
+    const void* weights,
+    const void* scales,
+    const void* zero_points_u8,
+    const void* bias,
+    void* output,
+    int64_t total_rows,
+    int64_t num_experts,
+    int64_t N,
+    int64_t K,
+    int64_t block_size,
+    int64_t element_size_bytes);
+
+/* Query the exact grid policy used by hip_qmoe_ragged_matmul_nbits. The
+ * returned grid is min(upper_tasks, device_cu_count *
+ * resident_blocks_per_cu), where occupancy is queried for the adaptive
+ * 128-thread kernel on the current HIP device. Output pointers are host-side.
+ */
+HIP_KERNEL_API int hip_qmoe_ragged_matmul_nbits_get_launch_config(
+    int64_t total_rows,
+    int64_t N,
+    int32_t* device_cu_count,
+    int32_t* resident_blocks_per_cu,
+    int32_t* grid_blocks,
+    int64_t* upper_tasks);
+
+/* Deterministic routed-pair reduction. Reorders each token's k contributions
+ * by ascending expert id and rounds to fp16 after every addition, matching the
+ * old serial per-expert scatter-add path without atomics.
+ */
+HIP_KERNEL_API int hip_qmoe_reduce_sorted_pairs(
+    void* stream,
+    const void* sorted_expert_output,
+    const void* pair_to_sorted,
+    const void* expert_indices,
+    const void* expert_weights,
+    void* output,
+    int64_t num_tokens,
+    int64_t width,
+    int64_t k,
+    int64_t element_size_bytes);
+
 /* -------------------------------------------------------------------------
  * Fully fused MoE decode (num_tokens == 1).
  *
